@@ -1,0 +1,62 @@
+name: Build fatal stack-check caller diagnostic
+
+on:
+  push:
+    branches: [recalbox-16k]
+    paths:
+      - .github/workflows/stack-diagnostics.yml
+      - validation/stack_trace.c
+
+permissions:
+  contents: write
+
+jobs:
+  diagnostic:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build diagnostic without changing the game executable
+        run: |
+          set -eu
+          cc -std=c11 -shared -fPIC -g -O1 -fno-omit-frame-pointer \
+            -fno-stack-protector -Wall -Wextra -Werror \
+            validation/stack_trace.c -ldl -o libgtasa_stack_trace.so
+
+      - name: Verify caller logging still terminates with SIGABRT
+        shell: python
+        run: |
+          import os, resource, signal, subprocess
+          from pathlib import Path
+          Path('fatal-test.c').write_text('extern void __stack_chk_fail(void); int main(void) { __stack_chk_fail(); return 0; }\n')
+          subprocess.run(['cc', '-g', '-O0', 'fatal-test.c', '-o', 'fatal-test'], check=True)
+          env = os.environ.copy()
+          env['LD_PRELOAD'] = str(Path('libgtasa_stack_trace.so').resolve())
+          resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+          result = subprocess.run(['./fatal-test'], env=env, capture_output=True, text=True, timeout=10)
+          print(result.stderr, end='')
+          assert result.returncode == -signal.SIGABRT, result.returncode
+          assert 'STACK_GUARD_FAILURE caller=' in result.stderr
+          print('PASS: diagnostic records caller and preserves SIGABRT')
+
+      - name: Export diagnostic through connected GitHub API
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const zlib = require('zlib');
+            const crypto = require('crypto');
+            const data = fs.readFileSync('libgtasa_stack_trace.so');
+            const compressed = zlib.gzipSync(data);
+            const manifest = {
+              source_commit: context.sha,
+              file_name: 'libgtasa_stack_trace.so',
+              sha256: crypto.createHash('sha256').update(data).digest('hex'),
+              gzip_sha256: crypto.createHash('sha256').update(compressed).digest('hex'),
+              gzip_base64: compressed.toString('base64'),
+            };
+            const blob = await github.rest.git.createBlob({
+              owner: context.repo.owner, repo: context.repo.repo,
+              content: JSON.stringify(manifest), encoding: 'utf-8',
+            });
+            core.info('STACK_TRACE_MANIFEST ' + blob.data.sha);
