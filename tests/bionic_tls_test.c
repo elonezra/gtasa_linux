@@ -125,7 +125,20 @@ static void fixture_test(void) {
 }
 #endif
 
-int main(void) {
+int main(int argc, char **argv) {
+  if (argc == 3 && strcmp(argv[1], "--map-only") == 0) {
+    so_module module;
+    if (so_load(&module, argv[2], NULL, 0) != 0) {
+      fprintf(stderr, "Payload mapping/guard adaptation failed: %s\n", strerror(errno));
+      return 1;
+    }
+    so_finalize(&module);
+    so_free_temp(&module);
+    assert(so_unload(&module) == 0);
+    puts("PASS: payload mapped, guard sites validated, finalized and unloaded; no payload code executed");
+    return 0;
+  }
+  assert(argc == 1);
   plan_test();
 #ifdef __aarch64__
   fixture_test();
