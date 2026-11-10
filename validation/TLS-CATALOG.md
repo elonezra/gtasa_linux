@@ -16,8 +16,14 @@ The candidate matcher requires compiler guard saves, stack-slot comparisons
 and a failure branch. The additional control-flow analysis requires each load
 base to contain TPIDR_EL0 on every incoming path. It accounts for register
 overwrites, pair loads, caller-clobbered registers, stack spills, frame offsets,
-non-returning stack-check failures and verified LDR/B-back veneers. Unsupported
-flow is rejected rather than treated as proof of a guard access. Generation
+non-returning stack-check failures and verified LDR/B-back veneers. It resolves
+indirect switch tables from their bounds, read-only offsets and in-function
+targets. The generator follows those case
+edges and verifies that no proven TP guard read was omitted; two checks per
+function alone cannot establish coverage. The bike mission AI regression
+requires all 36 guard reads, including the failing exit at 0x3d55e4.
+
+Unsupported flow is rejected rather than treated as proof of a guard access. Generation
 fails if any guarded function has fewer than two validated sites.
 
 The old proximity-only matcher incorrectly selected CEntity::Render+0x198

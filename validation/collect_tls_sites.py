@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 import re
 import struct
-from tls_register_flow import tp_provenance
+from tls_register_flow import tp_provenance, switch_successors
 
 
 def branch_target(word, pc):
@@ -15,6 +15,22 @@ def branch_target(word, pc):
     if immediate & 0x2000000:
         immediate -= 0x4000000
     return pc+immediate*4
+
+
+def guard_failure_edge(rows, comparison_index, is_failure_target):
+    following = comparison_index+1
+    if following >= len(rows):
+        return False
+    pc, _, branch = rows[following]
+    if branch.startswith('b.ne #'):
+        return is_failure_target(pc+int(branch.split('#')[1], 0))
+    # Some switch exits branch on equality to the successful return/tail-call,
+    # then fall through to an unconditional branch to __stack_chk_fail.
+    if branch.startswith('b.eq #') and following+1 < len(rows):
+        pc, _, branch = rows[following+1]
+        if branch.startswith('b #'):
+            return is_failure_target(pc+int(branch.split('#')[1], 0))
+    return False
 
 
 def external_load_thunks(elf, rows, start, size):
@@ -126,6 +142,8 @@ def main():
             fail_plt = elf.named['.plt'][3]+32+16*index
     assert fail_plt == 0x7f47b0
     records, unknown, sites, misses, rejected = [], [], [], [], []
+    switch_tables = {}
+    unmatched_tp_sites = []
     for start, size in elf.function_ranges():
         words = [elf.word(pc) for pc in range(start, start+size-3, 4)]
         mrs = [i for i, word in enumerate(words) if word & 0xffffffe0 == 0xd53bd040]
@@ -207,8 +225,7 @@ def main():
                     text = rows[k][2]
                     if (text.startswith('cmp ') and re.search(r'\b'+reg+r'\b',text)
                             and re.search(r'\b'+saved+r'\b',text)):
-                        branch = rows[k+1][2]
-                        if branch.startswith('b.ne #') and is_failure_target(rows[k+1][0]+int(branch.split('#')[1],0)):
+                        if guard_failure_edge(rows, k, is_failure_target):
                             picked.add(i)
                         break
                     if text.startswith(('bl ', 'blr ', 'ret', 'b.','b #','cbz ','cbnz ','tbz ','tbnz ')):
@@ -218,13 +235,25 @@ def main():
         # A nearby stack comparison is insufficient: the load base must still
         # contain TPIDR_EL0 on every path. Otherwise an object-field load can
         # be mistaken for the following guard load that reuses its destination.
-        provenance = tp_provenance(b''.join(struct.pack('<I', word) for word in words),
+        code = b''.join(struct.pack('<I', word) for word in words)
+        switches = switch_successors(code, start,
+                                     lambda address, size: elf.data[elf.offset(address):elf.offset(address)+size])
+        switch_tables.update({hex(address): sorted(targets) for address, targets in switches.items()})
+        provenance = tp_provenance(code,
                                    start, noreturn_targets={fail_plt},
-                                   external_branches=external_load_thunks(elf, rows, start, size))
+                                   external_branches=external_load_thunks(elf, rows, start, size),
+                                   indirect_branches=switches)
         unsafe = {i for i in picked
                   if (rows[i][1] >> 5) & 31 not in provenance[rows[i][0]]}
         rejected.extend({'address': rows[i][0], 'word': rows[i][1]} for i in sorted(unsafe))
         picked -= unsafe
+        # A switch can contain dozens of guard exits. Two sites per function
+        # is insufficient to establish complete coverage.
+        unmatched_tp_sites.extend(rows[i][0] for i, (_, word, _) in enumerate(rows)
+                                  if word & 0xffc00000 == 0xf9400000
+                                  and ((word >> 10) & 4095)*8 == 40
+                                  and (word >> 5) & 31 in provenance[rows[i][0]]
+                                  and i not in picked)
         for i in sorted(picked):
             sites.append({'address': rows[i][0], 'word': rows[i][1]})
         if picked:
@@ -245,12 +274,16 @@ def main():
             unknown.append({'start': hex(start), 'size': size, 'mrs': len(mrs),
                             'loads': len(loads), 'examples': [rows[i][2] for i in loads][:6]})
     output = {'sha256': hashlib.sha256(elf.data).hexdigest(), 'functions': records,
-              'sites': sites, 'rejected_non_tp': rejected}
+              'sites': sites, 'rejected_non_tp': rejected, 'switch_tables': switch_tables}
     Path('validation/tls-site-audit.json').write_text(json.dumps(output, indent=2)+'\n')
     print('Functions with TP reads:', len(records), 'TP reads:', sum(len(r['mrs']) for r in records),
           'candidate loads:', sum(len(r['loads']) for r in records))
     print('Matched guard sites:',len(sites),'Functions with <2 sites:',len(misses))
     print('Rejected non-TP field loads:', len(rejected))
+    print('Resolved indirect switch tables:', len(switch_tables))
+    print('Unmatched proven TP reads:', len(unmatched_tp_sites))
+    if unmatched_tp_sites:
+        raise SystemExit('Guard matching missed proven TP reads: '+', '.join(hex(a) for a in unmatched_tp_sites))
     print(json.dumps(misses[:20],indent=2))
     if misses:
         raise SystemExit('Guard catalog incomplete; no runtime header generated')

@@ -39,6 +39,8 @@ static void plan_test(void) {
   assert(bionic_tls_rebase_sites(image, sizeof(image), stack_load, 1, 80) == -1);
   assert(errno == EINVAL && memcmp(image, original, sizeof(image)) == 0);
   int found_render_guard = 0;
+  int found_bike_mission_guard = 0;
+  size_t bike_mission_guard_count = 0;
   for (size_t i = 0; i < sizeof(bionic_tls_guard_sites)/sizeof(bionic_tls_guard_sites[0]); i++) {
     assert(((bionic_tls_guard_sites[i] >> 5) & 31) < 29);
     const size_t address = (size_t)(bionic_tls_guard_sites[i] >> 10) * 4;
@@ -47,8 +49,14 @@ static void plan_test(void) {
     assert(address != 0x48d6e8);
     if (address == 0x48d6f4)
       found_render_guard = 1;
+    if (address == 0x3d55e4)
+      found_bike_mission_guard = 1;
+    if (address >= 0x3d44dc && address < 0x3d5640)
+      bike_mission_guard_count++;
   }
   assert(found_render_guard);
+  assert(found_bike_mission_guard);
+  assert(bike_mission_guard_count == 36);
 }
 
 #ifdef __aarch64__

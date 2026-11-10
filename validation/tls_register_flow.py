@@ -6,6 +6,7 @@ Register overwrites, pair loads and call-clobbered registers are accounted for.
 """
 from collections import deque
 import re
+import struct
 
 from capstone import Cs, CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN
 from capstone.arm64 import ARM64_OP_IMM, ARM64_OP_REG, ARM64_OP_MEM
@@ -20,7 +21,74 @@ def gpr(instruction, register):
     return int(match[1]) if match else None
 
 
-def tp_provenance(code, start, noreturn_targets=(), external_branches=None):
+def switch_successors(code, start, read_bytes):
+    """Resolve bounds-checked byte/halfword relative AArch64 jump tables."""
+    decoder = Cs(CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN)
+    decoder.detail = True
+    rows = list(decoder.disasm(code, start))
+    result = {}
+    for branch_index, branch in enumerate(rows):
+        if branch.mnemonic != 'br':
+            continue
+        destination = gpr(branch, branch.operands[0].reg)
+        # A few independent instructions can appear between ADD and BR.
+        add_index = next((i for i in range(branch_index-1, max(-1, branch_index-6), -1)
+                          if destination in {gpr(rows[i], reg) for reg in rows[i].regs_access()[1]}), None)
+        if add_index is None:
+            continue  # ordinary indirect tail call
+        add = rows[add_index]
+        if (add.mnemonic != 'add' or len(add.operands) != 3
+                or any(op.type != ARM64_OP_REG for op in add.operands)):
+            continue
+        offset_register = gpr(add, add.operands[2].reg)
+        load_index = next((i for i in range(add_index-1, max(-1, add_index-5), -1)
+                           if rows[i].mnemonic in {'ldrb', 'ldrh'}
+                           and gpr(rows[i], rows[i].operands[0].reg) == offset_register), None)
+        if load_index is None:
+            continue
+        load = rows[load_index]
+        mem = next(op for op in load.operands if op.type == ARM64_OP_MEM)
+        if not mem.mem.index:
+            continue
+        _, states = tp_provenance(code, start, indirect_branches=result,
+                                  return_states=True)
+        state = states.get(load.address, {})
+        def address_constant(register):
+            value = state.get(('r', register))
+            return value[1] if isinstance(value, tuple) and value[0] == 'address' else None
+        table = address_constant(gpr(load, mem.mem.base))
+        anchor = address_constant(gpr(add, add.operands[1].reg))
+        index_register = gpr(load, mem.mem.index)
+        bound = None
+        for i in range(load_index-1, max(-1, load_index-64), -1):
+            row = rows[i]
+            operands = row.operands
+            if (row.mnemonic == 'mov' and len(operands) == 2
+                    and all(op.type == ARM64_OP_REG for op in operands)
+                    and gpr(row, operands[0].reg) == index_register):
+                index_register = gpr(row, operands[1].reg)
+            if (row.mnemonic == 'cmp' and len(operands) == 2
+                    and operands[1].type == ARM64_OP_IMM
+                    and gpr(row, operands[0].reg) == index_register
+                    and any(r.mnemonic in {'b.hi', 'b.ls'} for r in rows[i+1:min(load_index, i+10)])):
+                bound = operands[1].imm
+                break
+        if table is None or anchor is None or bound is None or not 0 <= bound < 65536:
+            raise ValueError(f'Unresolved guarded switch table at {branch.address:#x}')
+        width = 1 if load.mnemonic == 'ldrb' else 2
+        raw = read_bytes(table+mem.mem.disp, width*(bound+1))
+        if len(raw) != width*(bound+1):
+            raise ValueError('Truncated switch table')
+        offsets = struct.unpack('<'+('B' if width == 1 else 'H')*(bound+1), raw)
+        targets = {anchor+(offset << add.operands[2].shift.value) for offset in offsets}
+        if any(target % 4 or not start <= target < start+len(code) for target in targets):
+            raise ValueError(f'Switch target outside guarded function at {branch.address:#x}')
+        result[branch.address] = targets
+    return result
+
+
+def tp_provenance(code, start, noreturn_targets=(), external_branches=None,
+                  indirect_branches=None, return_states=False):
     decoder = Cs(CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN)
     decoder.detail = True
     rows = list(decoder.disasm(code, start))
@@ -28,6 +96,7 @@ def tp_provenance(code, start, noreturn_targets=(), external_branches=None):
         raise ValueError(f'Incomplete AArch64 decode at {start:#x}')
     by_address = {row.address: i for i, row in enumerate(rows)}
     external_branches = external_branches or {}
+    indirect_branches = indirect_branches or {}
     if not rows:
         return {}
     incoming = [None]*len(rows)
@@ -47,6 +116,8 @@ def tp_provenance(code, start, noreturn_targets=(), external_branches=None):
         op, operands = instruction.mnemonic, instruction.operands
         if op == 'mrs' and instruction.op_str.endswith('tpidr_el0'):
             state['r', gpr(instruction, operands[0].reg)] = 'tp'
+        elif op in {'adr', 'adrp'}:
+            state['r', gpr(instruction, operands[0].reg)] = ('address', operands[1].imm)
         elif (op == 'mov' and len(operands) == 2
               and all(operand.type == ARM64_OP_REG for operand in operands)
               and instruction.reg_name(operands[0].reg)[:1] not in {'w'}):
@@ -61,6 +132,9 @@ def tp_provenance(code, start, noreturn_targets=(), external_branches=None):
             if isinstance(source, int):
                 amount = operands[2].imm << operands[2].shift.value
                 state['r', gpr(instruction, operands[0].reg)] = source + (amount if op == 'add' else -amount)
+            elif isinstance(source, tuple) and source[0] == 'address':
+                amount = operands[2].imm << operands[2].shift.value
+                state['r', gpr(instruction, operands[0].reg)] = ('address', source[1]+(amount if op == 'add' else -amount))
         mem = next((operand for operand in operands if operand.type == ARM64_OP_MEM), None)
         if mem is not None:
             base = before.get(('r', gpr(instruction, mem.mem.base)))
@@ -100,6 +174,8 @@ def tp_provenance(code, start, noreturn_targets=(), external_branches=None):
             for register in range(19):
                 state.pop(('r', register), None)
         successors = []
+        if op == 'br' and instruction.address in indirect_branches:
+            successors.extend(by_address[address] for address in indirect_branches[instruction.address])
         no_return_call = (op == 'bl' and operands and operands[0].type == ARM64_OP_IMM
                           and operands[0].imm in noreturn_targets)
         if not no_return_call and op not in {'ret', 'br', 'b'} and index+1 < len(rows):
@@ -121,6 +197,9 @@ def tp_provenance(code, start, noreturn_targets=(), external_branches=None):
             if incoming[successor] != updated:
                 incoming[successor] = updated
                 todo.append(successor)
-    return {row.address: frozenset(key[1] for key, value in (incoming[i] or {}).items()
-                                  if key[0] == 'r' and value == 'tp')
-            for i, row in enumerate(rows)}
+    provenance = {row.address: frozenset(key[1] for key, value in (incoming[i] or {}).items()
+                                        if key[0] == 'r' and value == 'tp')
+                  for i, row in enumerate(rows)}
+    if return_states:
+        return provenance, {row.address: incoming[i] or {} for i, row in enumerate(rows)}
+    return provenance
