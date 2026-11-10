@@ -90,7 +90,10 @@ static inline void *mc_thread_key(void) {
 // Program} invalidate the bind caches so a reused id is never wrongly skipped.
 // Set glc_enabled = 0 for a pure pass-through if a rendering glitch is suspected.
 // ---------------------------------------------------------------------------
-static int glc_enabled = 1;
+/* Use direct GL state changes while validating the Pi/V3D renderer. The cache
+ * assumes exclusive ownership of all state, including texture-unit bindings;
+ * that assumption has not been established for the SDL2 bridge. */
+static int glc_enabled = 0;
 
 #define GLC_MAXCAPS 24
 static struct { GLenum cap; GLboolean on; } glc_caps[GLC_MAXCAPS];

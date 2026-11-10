@@ -15,6 +15,8 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <signal.h>
+#include <ucontext.h>
 
 #include "aml_mod.h"
 #include "config.h"
@@ -35,6 +37,60 @@ extern void linux_release_sdl_context(void);
 
 so_module donor_mod;
 so_module game_mod;
+
+/* Preserve fatal signals while recording enough information to symbolize a
+ * crash in a library mapped by our custom loader. Only async-signal-safe
+ * operations are used in the handler; no stack walk or allocator is needed. */
+static char *fault_hex(char *out, uintptr_t value) {
+  static const char digits[] = "0123456789abcdef";
+  *out++ = '0'; *out++ = 'x';
+  for (int shift = (int)(sizeof(value) * 8) - 4; shift >= 0; shift -= 4)
+    *out++ = digits[(value >> shift) & 15];
+  return out;
+}
+
+static char *fault_label(char *out, const char *label, uintptr_t value) {
+  while (*label) *out++ = *label++;
+  return fault_hex(out, value);
+}
+
+static void fatal_signal_trace(int sig, siginfo_t *info, void *context) {
+  uintptr_t pc = 0, lr = 0, sp = 0;
+#if defined(__aarch64__)
+  const ucontext_t *state = context;
+  pc = state->uc_mcontext.pc;
+  lr = state->uc_mcontext.regs[30];
+  sp = state->uc_mcontext.sp;
+#else
+  (void)context;
+#endif
+  char line[512], *out = line;
+  out = fault_label(out, "FATAL_SIGNAL signal=", (uintptr_t)sig);
+  out = fault_label(out, " address=", (uintptr_t)info->si_addr);
+  out = fault_label(out, " pc=", pc);
+  out = fault_label(out, " lr=", lr);
+  out = fault_label(out, " sp=", sp);
+  out = fault_label(out, " game_base=", (uintptr_t)game_mod.load_base);
+  if (pc >= (uintptr_t)game_mod.load_base &&
+      pc - (uintptr_t)game_mod.load_base < game_mod.load_size)
+    out = fault_label(out, " game_offset=", pc - (uintptr_t)game_mod.load_base);
+  *out++ = '\n';
+  (void)write(STDERR_FILENO, line, (size_t)(out - line));
+  /* SA_RESETHAND has restored the default disposition. Re-raise while the
+   * signal is blocked; returning delivers it normally with its fatal status. */
+  (void)raise(sig);
+}
+
+static void install_fatal_signal_trace(void) {
+  struct sigaction action = {0};
+  action.sa_sigaction = fatal_signal_trace;
+  action.sa_flags = SA_SIGINFO | SA_RESETHAND;
+  sigemptyset(&action.sa_mask);
+  sigaction(SIGSEGV, &action, NULL);
+  sigaction(SIGBUS, &action, NULL);
+  sigaction(SIGILL, &action, NULL);
+  sigaction(SIGABRT, &action, NULL);
+}
 
 volatile int g_hide_saves;
 int g_hide_saves_frames;
@@ -189,6 +245,8 @@ void hard_exit(void) {
 }
 
 int main(void) {
+  install_fatal_signal_trace();
+  fprintf(stderr, "graphics: direct GL state dispatch; fatal address tracing enabled\n");
   setenv("MESA_GLTHREAD", "true", 1);
   setenv("GALLIUM_THREAD", "0", 1);
 
