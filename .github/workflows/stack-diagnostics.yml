@@ -28,7 +28,7 @@ jobs:
         run: |
           import os, resource, signal, subprocess
           from pathlib import Path
-          Path('fatal-test.c').write_text('extern void __stack_chk_fail(void); int main(void) { __stack_chk_fail(); return 0; }\n')
+          Path('fatal-test.c').write_text('extern void __stack_chk_fail(void); int main(void) { __stack_chk_fail(); return 0; }' + chr(10))
           subprocess.run(['cc', '-g', '-O0', 'fatal-test.c', '-o', 'fatal-test'], check=True)
           env = os.environ.copy()
           env['LD_PRELOAD'] = str(Path('libgtasa_stack_trace.so').resolve())

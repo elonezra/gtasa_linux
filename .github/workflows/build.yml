@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - '**'
+    paths-ignore:
+      - validation/stack_trace.c
+      - .github/workflows/stack-diagnostics.yml
   workflow_dispatch:
     inputs:
       publish:

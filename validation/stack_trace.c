@@ -25,7 +25,8 @@ __attribute__((noreturn, noinline)) void __stack_chk_fail(void)
             found && info.dli_sname ? info.dli_sname : "unknown");
         if (size > 0) {
             size_t length = (size_t)size < sizeof(message) ? (size_t)size : sizeof(message)-1;
-            (void)write(STDERR_FILENO, message, length);
+            ssize_t written = write(STDERR_FILENO, message, length);
+            (void)written;
         }
     }
     /* Never suppress, bypass, or return from the failed stack check. */
