@@ -20,6 +20,7 @@
 #include "../jni_fake.h"
 #include "../so_util.h"
 #include "../util.h"
+#include "../bionic_tls.h"
 
 extern so_module game_mod;
 extern void linux_release_sdl_context(void);
@@ -49,6 +50,8 @@ static void *game_thread_start(void *arg) {
   if (strcmp(start.name, "RenderQueue") == 0)
     linux_release_sdl_context();
   thread_registry_add();
+  if (bionic_tls_prepare_thread() != 0)
+    return NULL;
   /* Leave glibc's thread pointer intact. The game obtains JNIEnv through the
    * hook below and pthread TLS through our Bionic import adapters. */
   return start.func(start.arg);

@@ -51,5 +51,10 @@ RUN --mount=type=cache,target=/root/.cache/ccache,sharing=locked \
 
     /workspace/scripts/portmaster-build.sh build
 
+FROM scratch AS validation-artifact
+ARG GAME=gtasa
+COPY --from=game-build /workspace/build-${GAME}-portmaster/bionic_tls_test /bionic_tls_test
+COPY --from=game-build /workspace/build-${GAME}-portmaster/elf_pages_test /elf_pages_test
+
 FROM scratch AS artifact
 COPY --from=game-build /workspace/package/ /

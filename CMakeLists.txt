@@ -21,6 +21,7 @@ pkg_check_modules(OPENAL REQUIRED IMPORTED_TARGET openal)
 pkg_check_modules(MPG123 REQUIRED IMPORTED_TARGET libmpg123)
 
 add_executable(${GAME_BINARY_NAME}
+    source/bionic_tls.c
     source/aml_mod.c
     source/config.c
     source/error_linux.c
@@ -76,12 +77,24 @@ install(TARGETS ${GAME_BINARY_NAME} RUNTIME DESTINATION bin)
 
 include(CTest)
 if(BUILD_TESTING)
-    add_executable(elf_pages_test tests/elf_pages_test.c source/so_util.c source/error_linux.c)
+    add_executable(elf_pages_test tests/elf_pages_test.c source/so_util.c source/bionic_tls.c source/error_linux.c)
+    target_link_libraries(elf_pages_test PRIVATE pthread)
     target_include_directories(elf_pages_test PRIVATE source)
     target_compile_definitions(elf_pages_test PRIVATE _GNU_SOURCE)
     target_compile_options(elf_pages_test PRIVATE -Wall -Wextra -UNDEBUG)
     add_test(NAME elf_pages COMMAND elf_pages_test)
     set_tests_properties(elf_pages PROPERTIES TIMEOUT 10)
+    add_executable(bionic_tls_test tests/bionic_tls_test.c source/bionic_tls.c source/so_util.c source/error_linux.c)
+    target_include_directories(bionic_tls_test PRIVATE source)
+    target_compile_definitions(bionic_tls_test PRIVATE _GNU_SOURCE)
+    target_compile_options(bionic_tls_test PRIVATE -Wall -Wextra -UNDEBUG)
+    target_link_libraries(bionic_tls_test PRIVATE pthread)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "[Aa][Aa][Rr][Cc][Hh]64|[Aa][Rr][Mm]64")
+        enable_language(ASM)
+        target_sources(bionic_tls_test PRIVATE tests/bionic_tls_fixture.S)
+    endif()
+    add_test(NAME bionic_tls COMMAND bionic_tls_test)
+    set_tests_properties(bionic_tls PROPERTIES TIMEOUT 10)
     add_executable(input_linux_test tests/input_linux_test.c source/input_linux.c)
     target_include_directories(input_linux_test PRIVATE source)
     target_link_libraries(input_linux_test PRIVATE PkgConfig::SDL3 m)

@@ -22,6 +22,7 @@
 #include "config.h"
 #include "so_util.h"
 #include "elf_pages.h"
+#include "bionic_tls.h"
 #include "util.h"
 #include "error.h"
 
@@ -216,6 +217,11 @@ int so_load(so_module *mod, const char *filename, void *base, size_t max_size) {
 
   if (mod->syms == NULL || mod->dynstrtab == NULL) {
     res = -2;
+    goto err_free_load;
+  }
+
+  if (bionic_tls_patch_module(mod) != 0) {
+    res = -4;
     goto err_free_load;
   }
 

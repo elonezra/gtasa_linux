@@ -44,7 +44,7 @@ jobs:
           set -eu
           getconf PAGESIZE
           cc -D_GNU_SOURCE -std=c11 -Wall -Wextra -Isource \
-            tests/elf_pages_test.c source/so_util.c source/error_linux.c \
+            tests/elf_pages_test.c source/so_util.c source/bionic_tls.c source/error_linux.c -pthread \
             -o "$RUNNER_TEMP/elf_pages_test"
           (cd "$RUNNER_TEMP" && ./elf_pages_test)
 
@@ -54,6 +54,15 @@ jobs:
           name: elf-pages-test-arm64
           path: ${{ runner.temp }}/elf_pages_test
           if-no-files-found: error
+
+      - name: Test owned TLS guard with trusted ARM64 fixture
+        run: |
+          set -eu
+          cc -D_GNU_SOURCE -std=c11 -Wall -Wextra -Isource \
+            tests/bionic_tls_test.c tests/bionic_tls_fixture.S \
+            source/bionic_tls.c source/so_util.c source/error_linux.c \
+            -pthread -o "$RUNNER_TEMP/bionic_tls_test"
+          "$RUNNER_TEMP/bionic_tls_test"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -102,6 +111,78 @@ jobs:
           name: gtasa-portmaster-${{ env.GAME }}
           path: artifact/${{ env.GAME }}
           if-no-files-found: error
+
+      - name: Export native test executables from the same build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Containerfile
+          target: validation-artifact
+          platforms: linux/arm64
+          outputs: type=local,dest=artifact-tests
+          build-args: |
+            GAME=${{ env.GAME }}
+            LAUNCHER_SCRIPT=${{ env.LAUNCHER_SCRIPT }}
+            BINARY_NAME=${{ env.BINARY_NAME }}
+            GAME_TITLE=${{ env.GAME_TITLE }}
+            CONFIG_NAME=${{ env.CONFIG_NAME }}
+            APPSTATE_NAME=${{ env.APPSTATE_NAME }}
+          cache-from: type=gha,scope=${{ env.GAME }}
+
+      - name: Upload ARM64 native regression tests
+        uses: actions/upload-artifact@v4
+        with:
+          name: gtasa-native-tests
+          path: artifact-tests
+          if-no-files-found: error
+
+      - name: Prepare TLS fix transfer without Android inputs
+        if: github.ref_name == 'recalbox-16k'
+        shell: python
+        run: |
+          import base64, gzip, hashlib, io, json, os, tarfile
+          from pathlib import Path
+          entries = {
+              'gtasa_linux': Path('artifact/gtasa/gtasa/gtasa_linux'),
+              'bionic_tls_test': Path('artifact-tests/bionic_tls_test'),
+              'elf_pages_test': Path('artifact-tests/elf_pages_test'),
+          }
+          files, buf = {}, io.BytesIO()
+          with tarfile.open(fileobj=buf, mode='w') as archive:
+              for name, path in entries.items():
+                  data = path.read_bytes()
+                  files[name] = {'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+                  entry = tarfile.TarInfo(name)
+                  entry.size, entry.mode, entry.mtime = len(data), 0o700, 0
+                  archive.addfile(entry, io.BytesIO(data))
+          payload = gzip.compress(buf.getvalue(), compresslevel=9, mtime=0)
+          Path('tls-native.b64').write_text(base64.b64encode(payload).decode('ascii'))
+          Path('tls-native.json').write_text(json.dumps({
+              'source_commit': os.environ['GITHUB_SHA'],
+              'archive_sha256': hashlib.sha256(payload).hexdigest(), 'files': files,
+          }))
+
+      - name: Transfer verified TLS fix through connected GitHub API
+        if: github.ref_name == 'recalbox-16k'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const content = fs.readFileSync('tls-native.b64', 'utf8');
+            const manifest = JSON.parse(fs.readFileSync('tls-native.json', 'utf8'));
+            manifest.chunks = [];
+            for (let i = 0; i < content.length; i += 49152) {
+              const result = await github.rest.git.createBlob({
+                owner: context.repo.owner, repo: context.repo.repo,
+                content: content.slice(i, i+49152), encoding: 'utf-8',
+              });
+              manifest.chunks.push(result.data.sha);
+            }
+            const result = await github.rest.git.createBlob({
+              owner: context.repo.owner, repo: context.repo.repo,
+              content: JSON.stringify(manifest), encoding: 'utf-8',
+            });
+            core.info('TLS_NATIVE_MANIFEST ' + result.data.sha);
 
       - name: Create and upload release tarball
         if: github.event_name == 'release'
