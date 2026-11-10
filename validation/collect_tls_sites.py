@@ -7,6 +7,35 @@ import json
 from pathlib import Path
 import re
 import struct
+from tls_register_flow import tp_provenance
+
+
+def branch_target(word, pc):
+    immediate = word & 0x3ffffff
+    if immediate & 0x2000000:
+        immediate -= 0x4000000
+    return pc+immediate*4
+
+
+def external_load_thunks(elf, rows, start, size):
+    """Recognize only LDR; B-back veneers, preserving all other registers."""
+    result = {}
+    for pc, word, _ in rows:
+        if word & 0xfc000000 != 0x14000000:
+            continue
+        target = branch_target(word, pc)
+        if start <= target < start+size:
+            continue
+        try:
+            load, branch = elf.word(target), elf.word(target+4)
+        except ValueError:
+            continue
+        if load & 0xffc00000 != 0xf9400000 or branch & 0xfc000000 != 0x14000000:
+            continue
+        continuation = branch_target(branch, target+4)
+        if start <= continuation < start+size:
+            result[pc] = (continuation, {load & 31})
+    return result
 
 
 class ELF:
@@ -47,7 +76,13 @@ class ELF:
 
 class Disassembler:
     def __init__(self):
-        self.lib = c.CDLL('/usr/lib/libLLVM-15.so')
+        try:
+            self.lib = c.CDLL('/usr/lib/libLLVM-15.so')
+        except OSError:
+            from capstone import Cs, CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN
+            self.capstone = Cs(CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN)
+            self.lib = None
+            return
         for name in ['LLVMInitializeAArch64TargetInfo', 'LLVMInitializeAArch64Target',
                      'LLVMInitializeAArch64TargetMC', 'LLVMInitializeAArch64Disassembler']:
             fn = getattr(self.lib, name)
@@ -62,6 +97,13 @@ class Disassembler:
         self.lib.LLVMDisasmInstruction.restype = c.c_size_t
 
     def instruction(self, word, pc):
+        if self.lib is None:
+            instruction = next(self.capstone.disasm(struct.pack('<I', word), pc))
+            text = instruction.mnemonic+' '+instruction.op_str
+            if instruction.mnemonic in {'b', 'bl'} or instruction.mnemonic.startswith('b.'):
+                target = int(instruction.op_str.lstrip('#'), 0)
+                return instruction.mnemonic+' #'+str(target-pc)
+            return re.sub(r'#(-?0x[0-9a-f]+)', lambda match: '#'+str(int(match[1], 0)), text).strip()
         data = (c.c_uint8*4).from_buffer_copy(struct.pack('<I', word))
         out = c.create_string_buffer(256)
         assert self.lib.LLVMDisasmInstruction(self.context, data, 4, pc, out, len(out)) == 4
@@ -70,6 +112,7 @@ class Disassembler:
 
 def main():
     elf = ELF('/recalbox/share/roms/ports/gtasa/libGame.so')
+    assert hashlib.sha256(elf.data).hexdigest() == '4c6a7445e30b27afdda781302e4db9bac89c28fc1181b68b1eef16f84d6a282e', 'Unsupported payload for this version-bound catalog'
     llvm = Disassembler()
     dynamic = elf.named['.dynsym']
     names = elf.sections[dynamic[6]]
@@ -82,7 +125,7 @@ def main():
         if strings[name:].split(b'\0',1)[0] == b'__stack_chk_fail':
             fail_plt = elf.named['.plt'][3]+32+16*index
     assert fail_plt == 0x7f47b0
-    records, unknown, sites, misses = [], [], [], []
+    records, unknown, sites, misses, rejected = [], [], [], [], []
     for start, size in elf.function_ranges():
         words = [elf.word(pc) for pc in range(start, start+size-3, 4)]
         mrs = [i for i, word in enumerate(words) if word & 0xffffffe0 == 0xd53bd040]
@@ -172,6 +215,16 @@ def main():
                         break
                     if re.match(r'\w+ [xw](?:'+str(word&31)+'|'+saved[1:]+r'),',text) and not text.startswith(('str ','stur ','stp ','cmp ','tst ')):
                         break
+        # A nearby stack comparison is insufficient: the load base must still
+        # contain TPIDR_EL0 on every path. Otherwise an object-field load can
+        # be mistaken for the following guard load that reuses its destination.
+        provenance = tp_provenance(b''.join(struct.pack('<I', word) for word in words),
+                                   start, noreturn_targets={fail_plt},
+                                   external_branches=external_load_thunks(elf, rows, start, size))
+        unsafe = {i for i in picked
+                  if (rows[i][1] >> 5) & 31 not in provenance[rows[i][0]]}
+        rejected.extend({'address': rows[i][0], 'word': rows[i][1]} for i in sorted(unsafe))
+        picked -= unsafe
         for i in sorted(picked):
             sites.append({'address': rows[i][0], 'word': rows[i][1]})
         if picked:
@@ -191,11 +244,13 @@ def main():
         if len(loads) != 2*len(mrs):
             unknown.append({'start': hex(start), 'size': size, 'mrs': len(mrs),
                             'loads': len(loads), 'examples': [rows[i][2] for i in loads][:6]})
-    output = {'sha256': hashlib.sha256(elf.data).hexdigest(), 'functions': records, 'sites': sites}
+    output = {'sha256': hashlib.sha256(elf.data).hexdigest(), 'functions': records,
+              'sites': sites, 'rejected_non_tp': rejected}
     Path('validation/tls-site-audit.json').write_text(json.dumps(output, indent=2)+'\n')
     print('Functions with TP reads:', len(records), 'TP reads:', sum(len(r['mrs']) for r in records),
           'candidate loads:', sum(len(r['loads']) for r in records))
     print('Matched guard sites:',len(sites),'Functions with <2 sites:',len(misses))
+    print('Rejected non-TP field loads:', len(rejected))
     print(json.dumps(misses[:20],indent=2))
     if misses:
         raise SystemExit('Guard catalog incomplete; no runtime header generated')

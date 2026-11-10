@@ -39,6 +39,13 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
+      - name: Test guard-catalog register provenance with synthetic instructions
+        run: |
+          python3 -m venv "$RUNNER_TEMP/tls-catalog-python"
+          "$RUNNER_TEMP/tls-catalog-python/bin/pip" install -r validation/requirements-tls.txt
+          "$RUNNER_TEMP/tls-catalog-python/bin/python" -m unittest discover \
+            -s validation -p test_tls_register_flow.py -v
+
       - name: Test host-page loader with synthetic ELF only
         run: |
           set -eu

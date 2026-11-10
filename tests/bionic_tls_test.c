@@ -38,8 +38,17 @@ static void plan_test(void) {
   uint32_t stack_load[] = {0x3e8}; /* LDR x8, [SP,#0x28] must never be rebased. */
   assert(bionic_tls_rebase_sites(image, sizeof(image), stack_load, 1, 80) == -1);
   assert(errno == EINVAL && memcmp(image, original, sizeof(image)) == 0);
-  for (size_t i = 0; i < sizeof(bionic_tls_guard_sites)/sizeof(bionic_tls_guard_sites[0]); i++)
+  int found_render_guard = 0;
+  for (size_t i = 0; i < sizeof(bionic_tls_guard_sites)/sizeof(bionic_tls_guard_sites[0]); i++) {
     assert(((bionic_tls_guard_sites[i] >> 5) & 31) < 29);
+    const size_t address = (size_t)(bionic_tls_guard_sites[i] >> 10) * 4;
+    /* Pi watchpoint regression: this object-field load was formerly mistaken
+     * for the guard load below, copying position bytes over entity flags. */
+    assert(address != 0x48d6e8);
+    if (address == 0x48d6f4)
+      found_render_guard = 1;
+  }
+  assert(found_render_guard);
 }
 
 #ifdef __aarch64__
