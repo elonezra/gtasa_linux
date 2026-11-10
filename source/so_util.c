@@ -21,6 +21,7 @@
 
 #include "config.h"
 #include "so_util.h"
+#include "elf_pages.h"
 #include "util.h"
 #include "error.h"
 
@@ -56,45 +57,52 @@ void so_free_temp(so_module *mod) {
 }
 
 void so_finalize(so_module *mod) {
-  // Linux maps the image directly into its final address range.  Apply the
-  // final ELF segment permissions after relocations and hooks are complete.
-  const size_t num_pages = mod->load_size / 0x1000;
-  uint8_t *is_x_page = calloc(num_pages, 1);
-  if (!is_x_page) fatal_error("Error: out of memory in so_finalize");
+  const long host_page = host_page_size();
+  if (host_page < 0)
+    fatal_error("Error: cannot determine host page size: %s", strerror(errno));
+  const size_t page_size = (size_t)host_page;
+  if (!mod->load_base || mod->load_base != mod->load_virtbase ||
+      (uintptr_t)mod->load_virtbase % page_size != 0 ||
+      mod->load_size == 0 || mod->load_size % page_size != 0)
+    fatal_error("Error: invalid page geometry in so_finalize for %s", mod->name);
 
-  for (int i = 0; i < mod->phnum; i++) {
-    const Elf64_Phdr *p = &mod->phdr[i];
-    if (p->p_type != PT_LOAD || (p->p_flags & PF_X) != PF_X)
-      continue;
-    const size_t first = p->p_vaddr / 0x1000;
-    const size_t last = (ALIGN_MEM(p->p_vaddr + p->p_memsz, 0x1000) / 0x1000) - 1;
-    for (size_t pg = first; pg <= last && pg < num_pages; pg++)
-      is_x_page[pg] = 1;
+  const size_t num_pages = mod->load_size / page_size;
+  uint8_t *protections = calloc(num_pages, 1);
+  if (!protections) fatal_error("Error: out of memory in so_finalize");
+  if (elf_page_protections(mod->phdr, mod->phnum, mod->load_size,
+                           page_size, protections) != 0) {
+    const int error = errno;
+    free(protections);
+    if (error == ENOTSUP)
+      fatal_error("Error: %s requires writable and executable memory on the "
+                  "same %zu-byte host page; incompatible ELF segment layout "
+                  "(W^X preserved)", mod->name, page_size);
+    fatal_error("Error: invalid ELF page layout for %s: %s",
+                mod->name, strerror(error));
+    return;
   }
 
-  // First pass sets RX runs, second sets the rest RW.  Keeping the passes
-  // separate avoids ever asking Linux for writable+executable memory.
-  for (int want_x = 1; want_x >= 0; want_x--) {
-    size_t pg = 0;
-    while (pg < num_pages) {
-      if (is_x_page[pg] != want_x) {
-        pg++;
-        continue;
-      }
-      size_t run_end = pg;
-      while (run_end < num_pages && is_x_page[run_end] == want_x)
-        run_end++;
-      void *addr = (char *)mod->load_virtbase + pg * 0x1000;
-      size_t size = (run_end - pg) * 0x1000;
-      int prot = want_x ? (PROT_READ | PROT_EXEC) : (PROT_READ | PROT_WRITE);
-      if (mprotect(addr, size, prot) != 0)
-        fatal_error("Error: mprotect(%p, %zu, %s) failed: %s\n", addr, size,
-                    want_x ? "RX" : "RW", strerror(errno));
-      pg = run_end;
-    }
-  }
+  // Preserve the existing RX/non-X-RW policy, including read-only LOADs and
+  // gaps, so changing host page geometry does not tighten 4KB permissions.
+  // The union above is still needed to reject real writable/executable overlap.
+  for (size_t pg = 0; pg < num_pages; pg++)
+    protections[pg] = (protections[pg] & PROT_EXEC)
+                       ? (PROT_READ | PROT_EXEC) : (PROT_READ | PROT_WRITE);
 
-  free(is_x_page);
+  // Apply disjoint, host-page-aligned runs. The image starts RW for
+  // copying/relocation; the validated final plan never uses RWX.
+  for (size_t pg = 0; pg < num_pages;) {
+    size_t run_end = pg + 1;
+    while (run_end < num_pages && protections[run_end] == protections[pg])
+      run_end++;
+    void *addr = (char *)mod->load_virtbase + pg * page_size;
+    size_t size = (run_end - pg) * page_size;
+    if (mprotect(addr, size, protections[pg]) != 0)
+      fatal_error("Error: mprotect(%p, %zu, prot=%u, page=%zu) failed: %s\n",
+                  addr, size, (unsigned)protections[pg], page_size, strerror(errno));
+    pg = run_end;
+  }
+  free(protections);
 }
 
 int so_load(so_module *mod, const char *filename, void *base, size_t max_size) {
@@ -144,13 +152,26 @@ int so_load(so_module *mod, const char *filename, void *base, size_t max_size) {
   mod->load_size = 0;
   for (int i = 0; i < mod->elf_hdr->e_phnum; i++) {
     if (mod->prog_hdr[i].p_type == PT_LOAD) {
-      const size_t seg_end = mod->prog_hdr[i].p_vaddr + mod->prog_hdr[i].p_memsz;
+      const Elf64_Phdr *p = &mod->prog_hdr[i];
+      if (p->p_vaddr > SIZE_MAX || p->p_memsz > SIZE_MAX - p->p_vaddr ||
+          p->p_filesz > p->p_memsz || p->p_offset > mod->so_size ||
+          p->p_filesz > mod->so_size - p->p_offset) {
+        res = -4;
+        goto err_free_so;
+      }
+      const size_t seg_end = p->p_vaddr + p->p_memsz;
       if (seg_end > mod->load_size)
         mod->load_size = seg_end;
     }
   }
 
-  mod->load_size = ALIGN_MEM(mod->load_size, 0x1000);
+  const long host_page = host_page_size();
+  if (host_page < 0 || mod->load_size == 0 ||
+      host_page_round_up(mod->load_size, (size_t)host_page,
+                         &mod->load_size) != 0) {
+    res = -4;
+    goto err_free_so;
+  }
   if (max_size && mod->load_size > max_size) {
     res = -3;
     goto err_free_so;

@@ -37,6 +37,7 @@
 #include "config.h"
 #include "util.h"
 #include "so_util.h"
+#include "host_pages.h"
 #include "libc_shim.h"
 
 // ---------------------------------------------------------------------------
@@ -198,12 +199,15 @@ long sysconf_fake(int name) {
   switch (name) {
     case BIONIC_SC_PAGESIZE:
     case BIONIC_SC_PAGE_SIZE:
-      return 0x1000;
+      return host_page_size();
     case BIONIC_SC_NPROCESSORS_CONF:
     case BIONIC_SC_NPROCESSORS_ONLN:
       return 3;
-    case BIONIC_SC_PHYS_PAGES:
-      return (3ll * 1024 * 1024 * 1024) / 0x1000;
+    case BIONIC_SC_PHYS_PAGES: {
+      // Preserve the shim's synthetic 3 GiB budget, in actual host pages.
+      const long page_size = host_page_size();
+      return page_size > 0 ? (3ll * 1024 * 1024 * 1024) / page_size : -1;
+    }
     default:
       debugPrintf("libc: sysconf(%d) -> -1\n", name);
       return -1;
