@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include "bionic_tls.h"
 #include "bionic_tls_insns.h"
+#include "bionic_tls_sites.inc"
 
 int debugPrintf(char *fmt, ...) { (void)fmt; return 0; }
 
@@ -34,6 +35,11 @@ static void plan_test(void) {
   uint32_t duplicate[] = {sites[0], sites[0]};
   assert(bionic_tls_rebase_sites(image, sizeof(image), duplicate, 2, 80) == -1);
   assert(memcmp(image, original, sizeof(image)) == 0);
+  uint32_t stack_load[] = {0x3e8}; /* LDR x8, [SP,#0x28] must never be rebased. */
+  assert(bionic_tls_rebase_sites(image, sizeof(image), stack_load, 1, 80) == -1);
+  assert(errno == EINVAL && memcmp(image, original, sizeof(image)) == 0);
+  for (size_t i = 0; i < sizeof(bionic_tls_guard_sites)/sizeof(bionic_tls_guard_sites[0]); i++)
+    assert(((bionic_tls_guard_sites[i] >> 5) & 31) < 29);
 }
 
 #ifdef __aarch64__

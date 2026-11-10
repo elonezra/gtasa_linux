@@ -21,7 +21,8 @@ static inline int bionic_tls_rebase_sites(void *image, size_t image_size,
   size_t previous = 0;
   for (size_t i = 0; i < count; i++) {
     size_t address = (size_t)(sites[i] >> 10) * 4;
-    if (address > image_size - 4 || (i && address <= previous)) {
+    if (((sites[i] >> 5) & 31) >= 29 || address > image_size - 4 ||
+        (i && address <= previous)) {
       errno = EINVAL;
       return -1;
     }

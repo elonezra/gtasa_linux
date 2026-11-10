@@ -151,6 +151,8 @@ def main():
         for i, (_, word, _) in enumerate(rows):
             if word & 0xffc00000 != 0xf9400000 or ((word >> 10) & 4095)*8 != 40:
                 continue
+            if (word >> 5) & 31 >= 29:  # Saved stack/frame loads are not TP loads.
+                continue
             reg = f'x{word & 31}'
             for j in range(max(0, i-4), min(i+5, len(rows))):
                 text = rows[j][2]
@@ -201,6 +203,7 @@ def main():
     entries=[]
     for site in sorted(sites,key=lambda s:s['address']):
         assert site['word'] & ~1023 == 0xf9401400
+        assert (site['word'] >> 5) & 31 < 29
         assert site['address']%4 == 0 and site['address'] < 0x1000000
         entries.append((site['address']//4<<10)|(site['word']&1023))
     header='/* Generated from validated compiler guard save/check sequences.\n'
